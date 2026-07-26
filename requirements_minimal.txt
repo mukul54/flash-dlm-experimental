@@ -1,5 +1,10 @@
 # Core ML Dependencies (tested working versions)
+# torchvision/torchaudio must match torch exactly: both 0.22.0 and 2.7.0 declare
+# Requires-Dist: torch==2.7.0. Pinned so that installing an unrelated package
+# cannot pull in a mismatched build and silently replace the torch wheel.
 torch==2.7.0
+torchvision==0.22.0
+torchaudio==2.7.0
 # guided_diffusion imports transformers.generation.utils._crop_past_key_values,
 # which was removed in 4.55. Verified working on 4.53.3; 4.55+ fails at import.
 transformers>=4.51.0,<4.54

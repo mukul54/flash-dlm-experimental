@@ -16,11 +16,16 @@ sliding-window KV cache.
 
 Two things to know before you compare numbers:
 
-- **Dream only.** `guided_diffusion/` is written against the Dream modeling code
-  (`src/model/dream_flash/`). There is no LLaDA path, so results from this repo
-  belong in a Dream-7B comparison, not a LLaDA-1.5 one. Porting to LLaDA means
-  reimplementing the block/sliding-window cache hooks
-  (`reset_block_cache`, etc.) in `src/model/llada/modeling_llada.py`.
+- **Dream only, in this release.** `guided_diffusion/` is written against the
+  Dream modeling code (`src/model/dream_flash/`), so out of the box this repo
+  produces Dream-7B numbers. The paper does report LLaDA-8B-Instruct results
+  (guided by Qwen2.5-Instruct), but the LLaDA implementations behind them —
+  `src.model.block_cached_llada`, `src.model.opt_llada`, `src.model.llada_v2`,
+  all imported by `src/evaluator/llada_eval.py` — are not in this release, so
+  that evaluator raises `ImportError`. `src/model/llada/` is the stock upstream
+  LLaDA reference (no KV cache: see the assert in `modeling_llada.py:1360`)
+  plus two Gradio demos that load weights from the Hub. See
+  "Porting to LLaDA" below.
 - **`Dream-org/Dream-Flash-Instruct-7B` is not a separate checkpoint.**
   `src/model/auto_map.py` rewrites `-Flash` to `-v0`, so it loads
   `Dream-org/Dream-v0-Instruct-7B` weights under this repo's modeling code. The
@@ -40,11 +45,30 @@ python guided_diffusion/dream_eval/gsm8k_guided_evaluator.py \
   --config test_configs/dream/gsm8k/guided_diffusion/gsm8k_512_5shot_paper_protocol.yaml
 ```
 
-A second config,
-`gsm8k_512_5shot_paper_protocol_deterministic.yaml`, runs the stricter
-exact-match acceptance rule instead of top-2/relative-0.5. Report whichever
-setting you describe in the text; the deterministic one is more conservative on
-throughput and slightly better on accuracy.
+### Choosing an acceptance rule
+
+`dream.sampling_strategy` selects how the AR guider decides a draft token is
+safe to unmask. The mapping to the "Top-N Match" rows the FlashDLM paper
+reports:
+
+| Paper row | Config | Provided as |
+| --- | --- | --- |
+| Top-1 Match | `sampling_strategy: deterministic` | `gsm8k_512_5shot_paper_protocol_deterministic.yaml` |
+| Top-2 Match | `sampling_strategy: topk`, `acceptance_top_k: 2` | `gsm8k_512_5shot_top2match.yaml` |
+| Top-5 Match | `sampling_strategy: topk`, `acceptance_top_k: 5` | `gsm8k_512_5shot_top5match.yaml` |
+| *(not published)* | `sampling_strategy: topk_relative` | `gsm8k_512_5shot_paper_protocol.yaml` |
+
+Note the last row: the config shipped in this repo uses `topk_relative`, which
+adds a relative-probability threshold (`top_p`, read as `relative_threshold`)
+on top of top-k membership. It does not correspond to any published row. Use
+one of the first three if you want a number that lines up with the paper.
+
+### Shot count
+
+The FlashDLM paper reports GSM8K at **8-shot**. If your comparison table is
+5-shot, you need `nshot: 5` (what these configs use) and the two protocols are
+not interchangeable. To validate a setup against the paper's published numbers
+first, set `nshot: 8`, confirm you land near their figures, then switch to 5.
 
 Results land in `results/baselines/flashdlm/gsm8k_512_5shot/<node>_<gpu>/`:
 
@@ -111,6 +135,51 @@ Three fixes in this branch affect metrics produced by earlier runs of this code:
 Per-sample `denoising_steps` and `ar_model_calls` are now written to
 `eval_results.json`; older result files lack these fields and the summarizer
 will report tokens-per-step as `n/a` for them.
+
+## Porting to LLaDA
+
+The paper's LLaDA results pair **LLaDA-8B-Instruct** with a **Qwen2.5-Instruct**
+guider (1.5B / 3B / 7B), so the cross-tokenizer path in `TokenMapper`
+(`guided_diff_utils.py:94`, `decode()` → `encode()` per verification step) is
+the intended configuration for LLaDA, not a handicap — LLaDA's vocab is its own
+(mask id 126336), and the published latencies already include that overhead.
+
+Work required, in order of effort:
+
+1. **KV caching.** `src/model/llada/modeling_llada.py:1360` asserts
+   `past_key_values is None and not use_cache`. Port `BlockCache`
+   (`src/model/dream_flash/block_utils.py`) and `reset_block_cache` at all three
+   levels (`modeling_dream.py:345/598/809`) plus the
+   `use_block_diffusion / save_cache / clean_idx / block_size` forward plumbing.
+   LLaDA builds an `attention_bias` tensor rather than Dream's mask convention,
+   so the sliding-window masking is a rewrite, not a copy.
+2. **Module paths.** The decode loop hardcodes `dream_model.model.layers[i]`
+   (`guided_diff_utils.py:800`); LLaDA is `model.transformer.blocks[i]`, or
+   `transformer.block_groups` when `block_group_size > 1`.
+   `config.num_hidden_layers` needs no work — LLaDA aliases it to `n_layers`.
+3. **Remove the logit shift.** Three sites do
+   `logits = torch.cat([out.logits[:, :1], out.logits[:, :-1]], 1)`. Dream is
+   adapted from an AR backbone, so position *i* predicts token *i+1*; LLaDA
+   predicts position *i* in place. Left in, this produces fluent but wrong
+   output and a meaningless accuracy number.
+
+### Validating a port
+
+The published LLaDA figures give you something to check against. Useful
+reference points, all GSM8K 8-shot (generation length is not stated in those
+tables, so match it before comparing):
+
+| Setting | Accuracy | Latency |
+| --- | --- | --- |
+| LLaDA-8B baseline, block length 64 | 79.30 | 56.89 s |
+| LLaDA-8B + Qwen2.5-1.5B guider, Top-1 Match | 79.91 | 4.29 s |
+| LLaDA-8B + Qwen2.5-3B guider, Top-5 Match | 80.06 | 4.29 s |
+| Dream-7B + Qwen2.5-1.5B guider | 80.3 | 2.55 s |
+
+The last two rows give a cheap sanity ratio: with the same Qwen2.5-1.5B guider,
+LLaDA guided decoding is roughly 1.7x the per-sample latency of Dream guided
+decoding (4.29 s vs 2.55 s). A port landing far from that ratio at matching
+settings is probably wrong somewhere.
 
 ## Related methods not in this repo
 

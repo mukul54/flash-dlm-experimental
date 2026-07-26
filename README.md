@@ -75,6 +75,15 @@ Notes:
 python guided_diffusion/dream_eval/gsm8k_guided_evaluator.py --config test_configs/dream/gsm8k/guided_diffusion/<config-file>.yaml
 ```
 
+### Benchmarking (accuracy / throughput / tokens-per-step)
+
+See [BENCHMARKING.md](BENCHMARKING.md) for a reproducible GSM8K-512 protocol,
+metric definitions, and the settings that affect measured throughput.
+
+```bash
+bash scripts/run_gsm8k_512_benchmark.sh
+```
+
 ## Citation
 
 If you use this work, please cite our paper:

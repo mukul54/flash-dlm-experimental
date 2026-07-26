@@ -95,12 +95,16 @@ class GuidedDiffusionLogger:
             generated_text: str,
             ground_truth: str,
             is_correct: bool,
-            time_breakdown: dict = None):
+            time_breakdown: dict = None,
+            denoising_steps: int = None,
+            ar_model_calls: int = None):
         """Log a single evaluation result."""
         result = {
             "idx": idx,
             "sample_id": sample_id,
             "steps": steps,
+            "denoising_steps": denoising_steps,
+            "ar_model_calls": ar_model_calls,
             "max_new_tokens": max_new_tokens,
             "latency_ms": latency_ms,
             "input_length": input_length,
@@ -187,7 +191,10 @@ class BaseGuidedEvaluator:
         )
 
         # devices
-        if torch.cuda.is_available() and torch.cuda.device_count()>=2:
+        # single_device=true keeps both models on one GPU, which is what throughput
+        # benchmarking wants: a 2-GPU split adds cross-device copies to every step.
+        single_device = self.cfg["model"].get("single_device", False)
+        if torch.cuda.is_available() and torch.cuda.device_count()>=2 and not single_device:
             self.draft_dev = torch.device("cuda:0")
             self.ar_dev    = torch.device("cuda:1")
         else:
@@ -197,9 +204,10 @@ class BaseGuidedEvaluator:
         # models + tokenizers
         dname = self.cfg["model"]["draft_model"]
         aname = self.cfg["model"]["model_type"]
-        self.model_d = ModelMap(dname).fetch().to(self.draft_dev)
+        dtype = getattr(torch, self.cfg["model"].get("dtype", "float16"))
+        self.model_d = ModelMap(dname).fetch(torch_dtype=dtype).to(self.draft_dev)
         self.tok_d   = load_tokenizer(dname)
-        self.model_a = ModelMap(aname).fetch(device_map={"":self.ar_dev}).to(self.ar_dev)
+        self.model_a = ModelMap(aname).fetch(device_map={"":self.ar_dev}, torch_dtype=dtype).to(self.ar_dev)
         self.tok_a   = load_tokenizer(aname)
 
         # verifier
@@ -293,6 +301,48 @@ class BaseGuidedEvaluator:
         use_assist  = self.cfg["dream"].get("use_assisted",False)
         block_size  = self.cfg["dream"].get("block_size",None)
         
+        def _build_cfg(prompt_len):
+            C = AssistedDiffusionConfig if use_assist else SpecDiffusionConfig
+            gcfg = C(
+                max_length=prompt_len+max_new,
+                max_new_tokens=max_new,
+                mask_token_id=self.tok_d.mask_token_id,
+                eos_token_id=self.tok_d.eos_token_id,
+                early_stop=self.cfg["dream"].get("early_stop",False),
+                early_stop_consecutive=self.cfg["dream"].get("early_stop_consecutive",1),
+                temperature=self.cfg["dream"].get("temperature",0.2),
+                top_p=self.cfg["dream"].get("top_p",0.95),
+                sampling_strategy=self.cfg["dream"].get("sampling_strategy","deterministic"),
+                confidence_threshold=self.cfg["dream"].get("confidence_threshold",0.1),
+                use_sliding_window_caching=self.cfg["dream"].get("use_sliding_window_caching",False),
+                sliding_window_size=self.cfg["dream"].get("sliding_window_size",128),
+                use_block_boundary_caching=self.cfg["dream"].get("use_block_boundary_caching",False),
+                stop_on_dream_eos=self.cfg["dream"].get("stop_on_dream_eos",True),
+                return_dict_in_generate=True,
+            )
+            if use_block: gcfg.block_size = block_size
+            return gcfg
+
+        # Untimed warm-up: the first generation pays for lazy CUDA init and kernel
+        # autotuning, which would otherwise be charged to sample 1's throughput.
+        n_warmup = self.cfg["eval"].get("warmup_samples", 0)
+        if n_warmup > 0 and use_block and self.pairs:
+            fn = assisted_block_diffusion_generate if use_assist else speculative_block_diffusion_generate
+            for w in range(min(n_warmup, len(self.pairs))):
+                enc = self.tok_d(self.pairs[w][0], return_tensors="pt")
+                print(f"[warmup {w+1}/{n_warmup}] running untimed generation")
+                fn(
+                    dream_model=self.model_d,
+                    ar_model=self.model_a,
+                    input_ids=enc.input_ids.to(self.draft_dev),
+                    attention_mask=enc.attention_mask.to(self.draft_dev),
+                    config=_build_cfg(enc.input_ids.shape[1]),
+                    dream_tokenizer=self.tok_d,
+                    ar_tokenizer=self.tok_a,
+                )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
         desc = self._tqdm_desc or f"{self.cfg['model']['model_type']}"
         bar = tqdm(self.pairs,
                     total=len(self.pairs),
@@ -310,27 +360,11 @@ class BaseGuidedEvaluator:
             logging.info(f"Sample {idx+1}/{len(self.pairs)} - Input tokens: {curr_in}, Running avg: {tot_in/(idx+1):.4f}")
 
             # build config
-            C = AssistedDiffusionConfig if use_assist else SpecDiffusionConfig
-            cfg = C(
-                max_length=inp.shape[1]+max_new,
-                max_new_tokens=max_new,
-                mask_token_id=self.tok_d.mask_token_id,
-                eos_token_id=self.tok_d.eos_token_id,
-                early_stop=self.cfg["dream"].get("early_stop",False),
-                early_stop_consecutive=self.cfg["dream"].get("early_stop_consecutive",1),
-                temperature=self.cfg["dream"].get("temperature",0.2),
-                top_p=self.cfg["dream"].get("top_p",0.95),
-                sampling_strategy=self.cfg["dream"].get("sampling_strategy","deterministic"),
-                confidence_threshold=self.cfg["dream"].get("confidence_threshold",0.1),
-                use_sliding_window_caching=self.cfg["dream"].get("use_sliding_window_caching",False),
-                sliding_window_size=self.cfg["dream"].get("sliding_window_size",128),
-                use_block_boundary_caching=self.cfg["dream"].get("use_block_boundary_caching",False),
-                stop_on_dream_eos=self.cfg["dream"].get("stop_on_dream_eos",True),
-                return_dict_in_generate=True,
-            )
-            if use_block: cfg.block_size = block_size
+            cfg = _build_cfg(inp.shape[1])
 
             # generate with detailed timing breakdown
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             t0 = time.perf_counter()
             if use_block:
                 fn = assisted_block_diffusion_generate if use_assist else speculative_block_diffusion_generate
@@ -351,6 +385,8 @@ class BaseGuidedEvaluator:
                     input_ids=inp,
                     config=cfg,
                 )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             total_lat = (time.perf_counter()-t0)*1000; tot_lat += total_lat
 
             # Log current latency
@@ -375,6 +411,7 @@ class BaseGuidedEvaluator:
 
             # Get verification stats
             verification_stats = None
+            curr_steps = curr_ar_calls = curr_rejections = 0
             if hasattr(out, 'verification_stats'):
                 verification_stats = out.verification_stats
                 curr_steps = verification_stats.get('total_steps', 0)
@@ -404,7 +441,8 @@ class BaseGuidedEvaluator:
             # Log running averages
             if tot_steps > 0:
                 avg_steps = tot_steps/(idx+1)
-                avg_tokens_per_step = ((tot_act + (idx+1))/(idx+1))/avg_steps  # Add 1 EOS token per sample
+                # generated_length already includes the EOS token, so no extra offset here
+                avg_tokens_per_step = tot_act/tot_steps
                 avg_actual_tokens = tot_act/(idx+1)
                 avg_latency = tot_lat/(idx+1)
                 logging.info(f"Sample {idx+1} - Running averages - Steps: {avg_steps:.4f}, Tokens/step: {avg_tokens_per_step:.4f}, Actual tokens/sample: {avg_actual_tokens:.4f}, Avg latency: {avg_latency:.2f}ms")
@@ -437,7 +475,9 @@ class BaseGuidedEvaluator:
                 txt,
                 gold,
                 corr,
-                time_breakdown
+                time_breakdown,
+                denoising_steps=curr_steps,
+                ar_model_calls=curr_ar_calls,
             )
             if (idx+1)%100==0:
                 self.eval_logger.save()
@@ -473,7 +513,7 @@ class BaseGuidedEvaluator:
         # Runtime breakdown
         if tot_steps > 0:
             avg_steps = tot_steps/len(self.pairs)
-            avg_tokens_per_step = (tot_act + len(self.pairs))/tot_steps  # Add 1 EOS token per sample
+            avg_tokens_per_step = tot_act/tot_steps  # generated_length already includes EOS
             avg_time_per_step = tot_lat/tot_steps
             avg_time_per_token = tot_lat/tot_act if tot_act > 0 else 0
             
@@ -718,7 +758,7 @@ class BaseGuidedEvaluator:
             
             if tot_steps > 0:
                 avg_steps = tot_steps/len(self.pairs)
-                avg_tokens_per_step = (tot_act + len(self.pairs))/tot_steps  # Add 1 EOS token per sample
+                avg_tokens_per_step = tot_act/tot_steps  # generated_length already includes EOS
                 avg_time_per_step = tot_lat/tot_steps
                 avg_time_per_token = tot_lat/tot_act if tot_act > 0 else 0
                 

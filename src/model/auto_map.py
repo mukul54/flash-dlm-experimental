@@ -103,7 +103,7 @@ class ModelMap:
         self.pretrained = pretrained
         self.peft = False
         
-    def fetch(self, device_map="auto"):
+    def fetch(self, device_map="auto", torch_dtype=torch.float16):
         print(f"Attempting to fetch model: '{self.model_name}'")
         print(f"Available models: {list(MODEL_LIBRARY_MAP.keys())}")
         if self.model_name not in MODEL_LIBRARY_MAP:
@@ -120,7 +120,7 @@ class ModelMap:
                             self.model_name,
                             config=config,
                             load_in_8bit=False,
-                            torch_dtype=torch.float16,
+                            torch_dtype=torch_dtype,
                             device_map=device_map,
                             trust_remote_code=True,
                         )
@@ -139,7 +139,7 @@ class ModelMap:
                             self.model_name,
                             config=config,
                             trust_remote_code=True,
-                            torch_dtype=torch.float16,
+                            torch_dtype=torch_dtype,
                         )
                     # Qwen2.5-Omni variants
                     # elif "Qwen2.5-Omni" in self.model_name:
@@ -148,14 +148,14 @@ class ModelMap:
                     #         self.model_name,
                     #         config=config,
                     #         trust_remote_code=True,
-                    #         torch_dtype=torch.float16,
+                    #         torch_dtype=torch_dtype,
                     #     )
                     #     return model
                     else:
                         model = AutoModelForCausalLM.from_pretrained(
                             self.model_name,
                             load_in_8bit=False,
-                            torch_dtype=torch.float16,
+                            torch_dtype=torch_dtype,
                             # device_map="auto",
                             device_map=device_map,
                             trust_remote_code=True,

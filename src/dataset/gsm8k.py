@@ -5,7 +5,6 @@ GSM8K
 import copy
 import json
 import gzip
-import random
 
 from typing import Dict, Union
 from tqdm import tqdm
@@ -145,15 +144,18 @@ class GSM8K(DataStage):
         return trainset, validset
     
     def wrap_cot(self):
-        shuffled_cot = list(range(len(self.chain_of_thoughts)))
-        random.shuffle(shuffled_cot)
+        if self.nshot > len(self.chain_of_thoughts):
+            raise ValueError(
+                f"[GSM8K] nshot={self.nshot} exceeds the {len(self.chain_of_thoughts)} "
+                "available chain-of-thought exemplars"
+            )
 
         instruction = []
 
-        for cot in self.chain_of_thoughts:
+        for cot in self.chain_of_thoughts[:self.nshot]:
             wrapped_cot = self.wrap_text(cot, is_cot=True)
             instruction += wrapped_cot
-        
+
         return instruction
     
     def few_shot_dataset(self, dataset):

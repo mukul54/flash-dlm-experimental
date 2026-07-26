@@ -1,0 +1,74 @@
+# FlashDLM (guided diffusion) baseline on GSM8K, 5-shot, generation length 512.
+#
+# Protocol matches the Flash-dLLM paper's benchmark table:
+#   - full GSM8K test split (1319 problems)
+#   - 5-shot chain-of-thought prompting
+#   - generation length 512
+#   - batch size 1, single GPU
+#
+# Reported metrics come from the FINAL EVALUATION SUMMARY block in the run log,
+# or from `python scripts/summarize_flashdlm_metrics.py <run_dir>/eval_results.json`.
+seed: 42
+
+wandb:
+  project_name: flashdlm-baseline
+  experiment_name: gsm8k-512-5shot-flashdlm
+  flag: false
+
+model:
+  # autoregressive "verifier" (target) model
+  model_type: Qwen/Qwen2.5-1.5B-Instruct
+  # diffusion "proposer" (draft) model
+  draft_model: Dream-org/Dream-Flash-Instruct-7B
+  # keep both models on one GPU: a 2-GPU split adds a cross-device copy per step
+  single_device: true
+  dtype: bfloat16
+
+dataset:
+  name: "gsm8k"
+  train: "./dataset/gsm8k/inference/train.jsonl"
+  test:  "./dataset/gsm8k/inference/gsm8k_test.jsonl"
+  split: "test"
+  prm: false
+  nshot: 5
+  apply_chat_template: true
+
+save:
+  run_dir: results/baselines/flashdlm/gsm8k_512_5shot
+  logger: evaluation.log
+
+eval:
+  cot: true
+  max_gen_toks: 512
+  max_samples: 0      # 0 = full 1319-problem test split
+  subsample_seed: 42
+  warmup_samples: 1   # untimed; keeps CUDA init out of sample 1's latency
+
+train:
+  batch_size: 1
+
+dream:
+  steps: 512
+  eps: 1e-3
+
+  # block diffusion for performance
+  use_block_diffusion: true
+  block_size: 64
+  use_full_query_attn: false
+
+  use_sliding_window_caching: true
+  sliding_window_size: (256, 256)
+
+  # early stopping on EOS
+  early_stop: true
+  early_stop_consecutive: 1
+
+  # verification strategy: top-2 with relative threshold 0.5 (repo default)
+  sampling_strategy: "topk_relative"
+  acceptance_top_k: 2
+  top_p: 0.5
+
+  verify_batch_size: 32
+
+  # guided diffusion (AR-assisted parallel decoding)
+  use_assisted: true

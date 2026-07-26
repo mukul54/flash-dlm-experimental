@@ -43,6 +43,9 @@ eval:
   max_samples: 0      # 0 = full 1319-problem test split
   subsample_seed: 42
   warmup_samples: 1   # untimed; keeps CUDA init out of sample 1's latency
+  # resume: true picks up an interrupted run from eval_results.json instead
+  # of restarting. Off by default so a fresh run is always clean.
+  resume: false
 
 train:
   batch_size: 1

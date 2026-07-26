@@ -119,12 +119,64 @@ class GuidedDiffusionLogger:
         }
         self.results.append(result)
         
-    def save(self):
-        """Save all logged results to JSON file."""
+    def save(self, fatal: bool = False) -> bool:
+        """Write results to JSON atomically.
+
+        Writes a temp file and renames it, so an interrupted write cannot leave
+        a truncated file behind (which would also make --resume unusable).
+
+        A periodic checkpoint must never kill a run in progress: hours of
+        generation are far more expensive than one missed checkpoint, and
+        storage hiccups (EIO, transient quota, a stalled network mount) do
+        happen. Failures are reported and swallowed unless fatal=True.
+        """
         import json
-        with open(self.log_path, 'w') as f:
-            json.dump(self.results, f, indent=2)
-        print(f"Results saved to: {self.log_path}")
+        import os
+        import shutil
+
+        tmp_path = f"{self.log_path}.tmp"
+        try:
+            with open(tmp_path, 'w') as f:
+                json.dump(self.results, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.log_path)
+            print(f"Results saved to: {self.log_path}")
+            return True
+        except OSError as e:
+            try:
+                free_gb = shutil.disk_usage(Path(self.log_path).parent).free / 1e9
+                space = f", {free_gb:.2f} GB free on that filesystem"
+            except Exception:
+                space = ""
+            msg = (f"WARNING: could not write {self.log_path}: {e}{space}. "
+                   f"{len(self.results)} results are still held in memory.")
+            print(f"{RED}{msg}{RESET}", flush=True)
+            logging.warning(msg)
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            if fatal:
+                raise
+            return False
+
+    def load_existing(self) -> int:
+        """Load a previous run's results for resuming. Returns how many loaded."""
+        import json
+        path = Path(self.log_path)
+        if not path.exists() or path.stat().st_size == 0:
+            return 0
+        try:
+            with open(path) as f:
+                prior = json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"{RED}Could not read {path} for resume ({e}); starting fresh.{RESET}")
+            return 0
+        if not isinstance(prior, list):
+            return 0
+        self.results = prior
+        return len(prior)
 
 class BaseGuidedEvaluator:
     """
@@ -184,7 +236,10 @@ class BaseGuidedEvaluator:
 
         # JSON logger + wandb
         self.eval_logger = GuidedDiffusionLogger(str(run_dir/"eval_results.json"))
-        self.eval_logger.save()
+        # Do not touch the results file here: writing an empty list would destroy
+        # the very results a resume needs to read back.
+        if not self.cfg["eval"].get("resume", False):
+            self.eval_logger.save()
         wandb.init(
           project=self.cfg["save"].get("wandb_project","spec_diffusion"),
           config=self.cfg,
@@ -290,7 +345,9 @@ class BaseGuidedEvaluator:
         
         # Clear the log file and redirect stdout to both terminal and log file
         self.original_stdout = sys.stdout
-        self.log_file = open(self.log_path, 'w')  # 'w' mode to clear the file
+        # Append when resuming so the earlier run's log is not thrown away.
+        _log_mode = 'a' if self.cfg["eval"].get("resume", False) else 'w'
+        self.log_file = open(self.log_path, _log_mode)
         sys.stdout = TeeOutput(sys.stdout, self.log_file)
         
         # print config
@@ -307,6 +364,28 @@ class BaseGuidedEvaluator:
 
         # stats
         tot_corr = tot_lat = tot_act = tot_in = tot_steps = tot_ar_calls = tot_rejections = 0
+
+        # Resume: replay the counters from an interrupted run's results file and
+        # skip the samples it already covered. Off by default so a run always
+        # starts clean unless asked otherwise.
+        n_done = 0
+        if self.cfg["eval"].get("resume", False):
+            n_done = self.eval_logger.load_existing()
+            if n_done:
+                for r in self.eval_logger.results:
+                    tot_corr  += int(r["is_correct"])
+                    tot_lat   += r["latency_ms"]
+                    tot_act   += r["generated_length"]
+                    tot_in    += r["input_length"]
+                    tot_steps += r.get("denoising_steps") or 0
+                    tot_ar_calls += r.get("ar_model_calls") or 0
+                if n_done >= len(self.pairs):
+                    print(f"[RESUME] all {n_done} samples already present; nothing to do.")
+                    sys.stdout = self.original_stdout
+                    self.log_file.close()
+                    return
+                print(f"[RESUME] loaded {n_done} completed samples; "
+                      f"continuing from sample {n_done + 1}/{len(self.pairs)}")
         max_new     = self.cfg["eval"]["max_gen_toks"]
         use_block   = self.cfg["dream"].get("use_block_diffusion",False)
         use_assist  = self.cfg["dream"].get("use_assisted",False)
@@ -357,12 +436,14 @@ class BaseGuidedEvaluator:
                 torch.cuda.synchronize()
 
         desc = self._tqdm_desc or f"{self.cfg['model']['model_type']}"
-        bar = tqdm(self.pairs,
-                    total=len(self.pairs),
+        bar = tqdm(self.pairs[n_done:],
+                    total=len(self.pairs) - n_done,
+                    initial=0,
                     desc=desc,
                     postfix={"acc":"0.00%","avg_lat":"0.00s"})
 
-        for idx,(prompt,gold) in enumerate(bar):
+        for _offset,(prompt,gold) in enumerate(bar):
+            idx = n_done + _offset
             # encode
             enc = self.tok_d(prompt, return_tensors="pt")
             inp = enc.input_ids.to(self.draft_dev)

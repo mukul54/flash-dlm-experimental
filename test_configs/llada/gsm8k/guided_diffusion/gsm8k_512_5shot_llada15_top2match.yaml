@@ -45,6 +45,9 @@ eval:
   max_samples: 0
   subsample_seed: 42
   warmup_samples: 1
+  # resume: true picks up an interrupted run from eval_results.json instead
+  # of restarting. Off by default so a fresh run is always clean.
+  resume: false
 
 train:
   batch_size: 1

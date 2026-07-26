@@ -99,10 +99,37 @@ python scripts/summarize_flashdlm_metrics.py \
   results/baselines/flashdlm/gsm8k_512_5shot/*/eval_results.json
 ```
 
-### Resuming
+### Resuming after a crash
 
 The evaluator **skips a run entirely** if `evaluation.log` already contains
 `FINAL EVALUATION SUMMARY`. Delete the run directory to force a re-run.
+
+If a run dies partway (storage hiccup, preemption, OOM), set `eval.resume: true`
+and launch the same config again. It reads `eval_results.json`, replays the
+counters from it, and continues from the next unfinished sample. The results
+file is written atomically, so an interrupted write cannot leave a truncated
+file; if it is unreadable anyway, resume reports that and starts clean.
+
+Periodic checkpoint writes never abort a run. A failed write prints a warning
+with the free space on that filesystem and keeps generating -- losing hours of
+GPU time to one bad `write()` is far worse than losing a checkpoint.
+
+### If accuracy looks wrong
+
+`scripts/diagnose_accuracy.py` runs a 2x2 over the two settings most likely to
+explain a low GSM8K score -- acceptance rule (`topk_relative` vs `topk`) and
+shot count (8 vs 5) -- on a shared 200-problem subset, and prints accuracy,
+throughput and tokens/step side by side:
+
+```bash
+python scripts/diagnose_accuracy.py --samples 200
+```
+
+`topk` accepts a draft token whenever it appears in the verifier's top-k, with
+no probability floor. `topk_relative` additionally requires the draft's
+probability to be at least `top_p` times the top probability, so it is strictly
+stricter: fewer tokens accepted per step, lower throughput, higher accuracy.
+The config shipped in this repo uses `topk_relative` with `top_p: 0.5`.
 
 ## Metric definitions
 

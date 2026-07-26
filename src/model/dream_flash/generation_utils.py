@@ -1061,7 +1061,10 @@ class DreamGenerationMixin:
 
 
 
-            else:
+            # The confidence-based branch above was commented out as unused, which
+            # left this `else` without its `if`. Keeping the block unconditional
+            # preserves the behaviour that branch removal intended.
+            if True:
                 # --------- Standard step-based unmasking ----------
                 number_transfer_tokens = int(num_mask_token * (1 - s / t)) if i < steps - 1 else num_mask_token
 

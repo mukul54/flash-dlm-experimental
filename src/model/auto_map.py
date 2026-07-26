@@ -47,6 +47,11 @@ MODEL_LIBRARY_MAP = {
     "Dream-org/Dream-v0-Instruct-7B": ('transformers', 'DreamForCausalLM'),
     "Dream-org/Dream-Flash-Instruct-7B": ('transformers', 'DreamFlashForCausalLM'),
 
+    # LLaDA models (block-cached implementation in src/model/llada_flash)
+    "GSAI-ML/LLaDA-8B-Instruct": ('transformers', 'LLaDAFlashModelLM'),
+    "GSAI-ML/LLaDA-8B-Base": ('transformers', 'LLaDAFlashModelLM'),
+    "GSAI-ML/LLaDA-1.5": ('transformers', 'LLaDAFlashModelLM'),
+
     "Qwen/Qwen2.5-7B-Instruct": ('transformers', 'AutoModelForCausalLM'),
     "Qwen/Qwen2.5-7B": ('transformers', 'AutoModelForCausalLM'),
     "Qwen/Qwen2.5-3B-Instruct": ('transformers', 'AutoModelForCausalLM'),
@@ -123,6 +128,16 @@ class ModelMap:
                             torch_dtype=torch_dtype,
                             device_map=device_map,
                             trust_remote_code=True,
+                        )
+                    # LLaDA variants. Imported lazily so that a problem in the
+                    # LLaDA implementation can never break a Dream run.
+                    elif "LLaDA" in self.model_name or "llada" in self.model_name:
+                        from src.model.llada_flash.modeling_llada import LLaDAFlashModelLM
+
+                        model = LLaDAFlashModelLM.from_pretrained(
+                            self.model_name,
+                            trust_remote_code=True,
+                            torch_dtype=torch_dtype,
                         )
                     # Dream 7b variants
                     elif "Dream" in self.model_name or "dream" in self.model_name:

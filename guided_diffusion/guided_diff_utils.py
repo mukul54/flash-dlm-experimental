@@ -178,58 +178,108 @@ class TokenMapper:
             print(f"Error checking tokenizer compatibility: {e}")
             self.skip_conversion = False
             print("Will use conversion")
+
+        # Lazily built by _build_tables(); only used when skip_conversion is False.
+        self._d2q = None
+        self._q2d = None
+        self._device_tables = {}
         
+
+    # ── length-preserving cross-vocabulary mapping ────────────────────────
+    #
+    # When the drafter and the verifier do not share a vocabulary, conversion
+    # MUST map one draft token to exactly one verifier token. A bulk
+    # decode()->encode() round-trip does not: the two tokenizers segment the
+    # same text differently, so the converted chunk can come back a different
+    # length. Verification indexes drafts and verifier logits by the same
+    # position and reports `accept_len` as a count of draft tokens, so any
+    # length change silently misaligns the sequence.
+    #
+    # Instead, build a per-ID lookup table once (decode a single token, encode
+    # it, keep the first resulting ID). Content is approximate for tokens with
+    # no clean counterpart, but positions always line up.
+    #
+    # None of this runs when skip_conversion is True (Dream + Qwen share a
+    # tokenizer), so the Dream path is untouched.
+
+    @staticmethod
+    def _vocab_len(tok) -> int:
+        try:
+            return max(int(tok.vocab_size), len(tok))
+        except TypeError:
+            return int(tok.vocab_size)
+
+    def _build_tables(self):
+        if getattr(self, "_d2q", None) is not None:
+            return
+
+        def table(src, dst) -> Tensor:
+            n = self._vocab_len(src)
+            texts = src.batch_decode([[i] for i in range(n)], skip_special_tokens=False)
+            encoded = dst(texts, add_special_tokens=False).input_ids
+            unk = dst.unk_token_id if dst.unk_token_id is not None else 0
+            return torch.tensor(
+                [ids[0] if len(ids) > 0 else unk for ids in encoded], dtype=torch.long
+            )
+
+        print("Building length-preserving token ID maps between drafter and verifier...")
+        self._d2q = table(self.dtok, self.qtok)
+        self._q2d = table(self.qtok, self.dtok)
+        self._device_tables: dict = {}
+
+    def _lookup(self, table: Tensor, ids: Tensor) -> Tensor:
+        key = (id(table), ids.device)
+        cached = self._device_tables.get(key)
+        if cached is None:
+            cached = table.to(ids.device)
+            self._device_tables[key] = cached
+        return cached[ids.long()]
 
     def dream_to_qwen_tensor(self, ids: Tensor, dev: torch.device) -> Tensor:
         """Convert Dream token IDs to Qwen token IDs."""
         if self.skip_conversion:
             return ids.to(dev)
-        
-        txt = self.dtok.decode(ids.tolist(), skip_special_tokens=False)
-        qids = self.qtok(txt, add_special_tokens=False).input_ids
-        return torch.tensor(qids, device=dev)
+
+        self._build_tables()
+        return self._lookup(self._d2q, ids.to(dev))
 
     def dream_to_qwen_id(self, did: int) -> int:
         """Convert single Dream token ID to Qwen token ID."""
         if self.skip_conversion:
             # Check if token has an equivalent
             return self.equivalent_tokens.get(did, did)
-        
-        return self.qtok(self.dtok.decode([did], skip_special_tokens=False),
-                        add_special_tokens=False).input_ids[0]
+
+        self._build_tables()
+        return int(self._d2q[did])
 
     def dream_to_qwen_ids(self, dids: Tensor) -> Tensor:
-        """Convert batch of Dream token IDs to Qwen token IDs."""
+        """Convert batch of Dream token IDs to Qwen token IDs (1:1 in length)."""
         if self.skip_conversion:
             # Convert each ID individually to handle equivalents
             # return torch.tensor([self.dream_to_qwen_id(did.item()) for did in dids], device=dids.device)
             return dids
-        
-        # Convert all IDs at once
-        txt = self.dtok.decode(dids.tolist(), skip_special_tokens=False)
-        qids = self.qtok(txt, add_special_tokens=False).input_ids
-        return torch.tensor(qids, device=dids.device)
+
+        self._build_tables()
+        return self._lookup(self._d2q, dids)
 
     def qwen_to_dream_id(self, qid: int) -> int:
         """Convert single Qwen token ID to Dream token ID."""
         if self.skip_conversion:
             # Check if token has an equivalent
             return self.equivalent_tokens.get(qid, qid)
-        
-        return self.dtok(self.qtok.decode([qid], skip_special_tokens=False),
-                        add_special_tokens=False).input_ids[0]
+
+        self._build_tables()
+        return int(self._q2d[qid])
 
     def qwen_to_dream_ids(self, qids: Tensor) -> Tensor:
-        """Convert batch of Qwen token IDs to Dream token IDs."""
+        """Convert batch of Qwen token IDs to Dream token IDs (1:1 in length)."""
         if self.skip_conversion:
             # return qids
             # return torch.tensor([self.qwen_to_dream_id(qid.item()) for qid in qids], device=qids.device)
             return qids
-        
-        # Convert all IDs at once
-        txt = self.qtok.decode(qids.tolist(), skip_special_tokens=False)
-        dids = self.dtok(txt, add_special_tokens=False).input_ids
-        return torch.tensor(dids, device=qids.device)
+
+        self._build_tables()
+        return self._lookup(self._q2d, qids)
 
 
 
@@ -670,6 +720,73 @@ def _early_stop_ok(seq: Tensor, eos: int, mask: int, k: int) -> bool:
     return (seq[0, -k:] == eos).all() and (seq == mask).sum() == 0
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 4b.  Diffusion-model adapters
+#
+# The decode loop below is written against Dream's call convention. Adapters
+# isolate the two places where another dLLM differs: how the block cache is
+# reset, and whether the model's logits need the Dream one-position shift.
+# ──────────────────────────────────────────────────────────────────────────────
+class DreamModelAdapter:
+    """Default adapter -- reproduces the original Dream call sequence exactly."""
+
+    # Dream is adapted from an autoregressive backbone, so position i's logits
+    # predict token i+1 and have to be shifted right by one before use.
+    logit_shift = True
+
+    @staticmethod
+    def reset_block_cache(model, bsz: int, max_length: int, block_size: int) -> None:
+        for layer_idx in range(model.config.num_hidden_layers):
+            model.model.layers[layer_idx].reset_block_cache(bsz, max_length, block_size)
+
+    @staticmethod
+    def forward(model, input_ids, position_ids, max_length, block_size, save_cache, clean_idx):
+        return model(
+            input_ids,
+            None,
+            position_ids,
+            use_block_diffusion=True,
+            use_full_query_attn=False,
+            max_length=max_length,
+            block_size=block_size,
+            save_cache=save_cache,
+            clean_idx=clean_idx,
+        )
+
+
+class LLaDAModelAdapter:
+    """Adapter for ``src.model.llada_flash.LLaDAFlashModelLM``."""
+
+    # LLaDA is a mask predictor: position i's logits predict token i in place.
+    # Applying Dream's shift here would produce fluent but wrong output.
+    logit_shift = False
+
+    @staticmethod
+    def reset_block_cache(model, bsz: int, max_length: int, block_size: int) -> None:
+        model.reset_block_cache(bsz, max_length, block_size)
+
+    @staticmethod
+    def forward(model, input_ids, position_ids, max_length, block_size, save_cache, clean_idx):
+        return model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            use_block_diffusion=True,
+            block_size=block_size,
+            save_cache=save_cache,
+            clean_idx=clean_idx,
+        )
+
+
+MODEL_ADAPTERS = {"dream": DreamModelAdapter, "llada": LLaDAModelAdapter}
+
+
+def _draft_logits(raw_logits: Tensor, adapter) -> Tensor:
+    """Align raw model logits so that index i predicts the token at position i."""
+    if adapter.logit_shift:
+        return torch.cat([raw_logits[:, :1], raw_logits[:, :-1]], dim=1)
+    return raw_logits
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 5.  Main speculative generator  (DEBUG prints kept verbatim)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -685,6 +802,7 @@ def assisted_block_diffusion_generate(
     ar_tokenizer,
     ar_verifier: ARAssistant = None,
     rng: Optional[torch.Generator] = None,
+    model_adapter=DreamModelAdapter,
 ) -> Union[Tensor, AssistedDiffusionOutput]:
     """
     Assisted diffusion generation with block KV caching.
@@ -796,23 +914,24 @@ def assisted_block_diffusion_generate(
         
         if diffusion_step == 0:
             # First step: reset block cache and save cache up to prompt
-            for layer_idx in range(dream_model.config.num_hidden_layers):
-                dream_model.model.layers[layer_idx].reset_block_cache(bsz, L, block_size)
+            model_adapter.reset_block_cache(dream_model, bsz, L, block_size)
             
             # Dream model forward pass timing
             dream_forward_start_time = time.perf_counter()
-            out = dream_model(seq, None, tok_idx if tok_idx is not None else None,
-                            use_block_diffusion=True,
-                            use_full_query_attn=False,
-                            max_length=max_len,
-                            block_size=block_size,
-                            save_cache=True,
-                            clean_idx=sliding_window_start if use_sliding_window_caching else prompt_len)
+            out = model_adapter.forward(
+                dream_model,
+                seq,
+                tok_idx if tok_idx is not None else None,
+                max_length=max_len,
+                block_size=block_size,
+                save_cache=True,
+                clean_idx=sliding_window_start if use_sliding_window_caching else prompt_len,
+            )
             dream_forward_end_time = time.perf_counter()
             dream_forward_time = (dream_forward_end_time - dream_forward_start_time) * 1000  # Convert to ms
             
             # Logits has shape [1, max_len, vocab_size]
-            logits = torch.cat([out.logits[:, :1], out.logits[:, :-1]], 1)
+            logits = _draft_logits(out.logits, model_adapter)
             
             # OLD: mask_pos = (seq[0] == mask_id).nonzero(as_tuple=True)[0]
             # Optimized mask position finding (first step)
@@ -840,17 +959,19 @@ def assisted_block_diffusion_generate(
                 
                 # Dream model forward pass timing
                 dream_forward_start_time = time.perf_counter()
-                out = dream_model(gen_seq, None, gen_tok_idx,
-                                use_block_diffusion=True,
-                                use_full_query_attn=False,
-                                max_length=max_len,
-                                block_size=block_size,
-                                save_cache=True,
-                                clean_idx=sliding_window_start)
+                out = model_adapter.forward(
+                    dream_model,
+                    gen_seq,
+                    gen_tok_idx,
+                    max_length=max_len,
+                    block_size=block_size,
+                    save_cache=True,
+                    clean_idx=sliding_window_start,
+                )
                 dream_forward_end_time = time.perf_counter()
                 dream_forward_time = (dream_forward_end_time - dream_forward_start_time) * 1000  # Convert to ms
                 # Logits has shape [1, remaining_len, vocab_size]
-                logits = torch.cat([out.logits[:, :1], out.logits[:, :-1]], dim=1)
+                logits = _draft_logits(out.logits, model_adapter)
                 # Get mask positions relative to the generation part
                 gen_mask_pos = (gen_seq[0] == mask_id).nonzero(as_tuple=True)[0]
                 
@@ -871,18 +992,20 @@ def assisted_block_diffusion_generate(
                 
                 # Dream model forward pass timing
                 dream_forward_start_time = time.perf_counter()
-                out = dream_model(gen_seq, None, gen_tok_idx,
-                                use_block_diffusion=True,
-                                use_full_query_attn=False,
-                                max_length=max_len,
-                                block_size=block_size,
-                                save_cache=False,
-                                clean_idx=None)
+                out = model_adapter.forward(
+                    dream_model,
+                    gen_seq,
+                    gen_tok_idx,
+                    max_length=max_len,
+                    block_size=block_size,
+                    save_cache=False,
+                    clean_idx=None,
+                )
                 dream_forward_end_time = time.perf_counter()
                 dream_forward_time = (dream_forward_end_time - dream_forward_start_time) * 1000  # Convert to ms
                 
                 # Logits has shape [1, max_len - prompt_len (i.e., gen_len), vocab_size]
-                logits = torch.cat([out.logits[:, :1], out.logits[:, :-1]], 1)
+                logits = _draft_logits(out.logits, model_adapter)
                 gen_mask_pos = (gen_seq[0] == mask_id).nonzero(as_tuple=True)[0]
                 
                 # Apply temperature sampling to Dream model draft generation

@@ -16,16 +16,32 @@ sliding-window KV cache.
 
 Two things to know before you compare numbers:
 
-- **Dream only, in this release.** `guided_diffusion/` is written against the
-  Dream modeling code (`src/model/dream_flash/`), so out of the box this repo
-  produces Dream-7B numbers. The paper does report LLaDA-8B-Instruct results
-  (guided by Qwen2.5-Instruct), but the LLaDA implementations behind them —
-  `src.model.block_cached_llada`, `src.model.opt_llada`, `src.model.llada_v2`,
-  all imported by `src/evaluator/llada_eval.py` — are not in this release, so
-  that evaluator raises `ImportError`. `src/model/llada/` is the stock upstream
-  LLaDA reference (no KV cache: see the assert in `modeling_llada.py:1360`)
-  plus two Gradio demos that load weights from the Hub. See
-  "Porting to LLaDA" below.
+- **Dream and LLaDA.** `guided_diffusion/` was originally written against the
+  Dream modeling code only. LLaDA support is added here via
+  `src/model/llada_flash/` plus a model adapter — see "Running LLaDA" below.
+  The upstream release shipped no cached LLaDA implementation: the modules
+  `src/evaluator/llada_eval.py` imports (`block_cached_llada`, `opt_llada`,
+  `llada_v2`) are absent, so that evaluator still raises `ImportError`. It is
+  unused by the benchmark path.
+
+### Two pre-existing bugs fixed here
+
+Both block a fresh checkout from running at all, independently of LLaDA:
+
+- `src/model/dream_flash/generation_utils.py` had a dangling `else:` at line
+  1064 — commit 552eaae commented out the `if` branch above it and left the
+  `else` behind. That is a `SyntaxError`, so importing `src.model.auto_map`
+  failed and no evaluator could start. The block is now unconditional, which is
+  what removing that branch intended.
+- `requirements_minimal.txt` pinned `transformers>=4.56.0`, but
+  `guided_diffusion` imports `transformers.generation.utils._crop_past_key_values`
+  (live code, `guided_diff_utils.py:695`), which was removed in 4.55. Installing
+  per the old pin failed at import. Now pinned `>=4.51.0,<4.54`; verified on
+  4.53.3.
+
+One thing left alone: `src/model/dream_flash/generation_utils.py:35` calls
+`AutoTokenizer.from_pretrained` at module import, so importing the package
+requires network access or a warm HF cache. Harmless in a normal setup.
 - **`Dream-org/Dream-Flash-Instruct-7B` is not a separate checkpoint.**
   `src/model/auto_map.py` rewrites `-Flash` to `-v0`, so it loads
   `Dream-org/Dream-v0-Instruct-7B` weights under this repo's modeling code. The
@@ -136,34 +152,66 @@ Per-sample `denoising_steps` and `ar_model_calls` are now written to
 `eval_results.json`; older result files lack these fields and the summarizer
 will report tokens-per-step as `n/a` for them.
 
-## Porting to LLaDA
+## Running LLaDA
 
-The paper's LLaDA results pair **LLaDA-8B-Instruct** with a **Qwen2.5-Instruct**
-guider (1.5B / 3B / 7B), so the cross-tokenizer path in `TokenMapper`
-(`guided_diff_utils.py:94`, `decode()` → `encode()` per verification step) is
-the intended configuration for LLaDA, not a handicap — LLaDA's vocab is its own
-(mask id 126336), and the published latencies already include that overhead.
+Guided diffusion runs on LLaDA-8B-Instruct and LLaDA-1.5 through the same
+evaluator; only the config changes.
 
-Work required, in order of effort:
+```bash
+bash scripts/run_gsm8k_512_benchmark.sh \
+  test_configs/llada/gsm8k/guided_diffusion/gsm8k_512_5shot_llada8b_top2match.yaml
+```
 
-1. **KV caching.** `src/model/llada/modeling_llada.py:1360` asserts
-   `past_key_values is None and not use_cache`. Port `BlockCache`
-   (`src/model/dream_flash/block_utils.py`) and `reset_block_cache` at all three
-   levels (`modeling_dream.py:345/598/809`) plus the
-   `use_block_diffusion / save_cache / clean_idx / block_size` forward plumbing.
-   LLaDA builds an `attention_bias` tensor rather than Dream's mask convention,
-   so the sliding-window masking is a rewrite, not a copy.
-2. **Module paths.** The decode loop hardcodes `dream_model.model.layers[i]`
-   (`guided_diff_utils.py:800`); LLaDA is `model.transformer.blocks[i]`, or
-   `transformer.block_groups` when `block_group_size > 1`.
-   `config.num_hidden_layers` needs no work — LLaDA aliases it to `n_layers`.
-3. **Remove the logit shift.** Three sites do
-   `logits = torch.cat([out.logits[:, :1], out.logits[:, :-1]], 1)`. Dream is
-   adapted from an AR backbone, so position *i* predicts token *i+1*; LLaDA
-   predicts position *i* in place. Left in, this produces fluent but wrong
-   output and a meaningless accuracy number.
+Configs provided:
 
-### Validating a port
+| Config | Model | Protocol |
+| --- | --- | --- |
+| `gsm8k_512_5shot_llada8b_top2match.yaml` | LLaDA-8B-Instruct | 5-shot, Top-2 Match |
+| `gsm8k_512_5shot_llada15_top2match.yaml` | LLaDA-1.5 | 5-shot, Top-2 Match |
+| `gsm8k_512_8shot_llada8b_top1match_validation.yaml` | LLaDA-8B-Instruct | 8-shot, Top-1 Match — reproduces the paper's published setting |
+
+LLaDA-1.5 is the same architecture as LLaDA-8B-Instruct (`model_type: llada`,
+`LLaDAModelLM`), so it loads under the same implementation. Confirm the HF repo
+id in the config before running.
+
+### How it works
+
+* `src/model/llada_flash/` is the block-cached implementation. `src/model/llada/`
+  is the stock upstream code and is left byte-identical — that is what you run
+  for the uncached 1.0x baseline row.
+* `model.family` in the config (`dream` or `llada`) picks a model adapter in
+  `guided_diff_utils.py`, which handles the two things that differ between
+  architectures: how the block cache is reset, and whether logits need Dream's
+  one-position shift. LLaDA is a mask predictor — position *i* predicts token
+  *i* in place — so no shift is applied. Defaulting `family` to `dream` keeps
+  every existing Dream config on exactly the previous code path.
+* Cross-vocabulary conversion between the drafter and the Qwen guider goes
+  through a precomputed per-ID table so it is 1:1 in length. This matters:
+  verification indexes drafts and verifier logits by position and reports
+  `accept_len` as a count of draft tokens, so a conversion that changes length
+  silently misaligns the sequence. The previous bulk `decode()`→`encode()` did
+  change length; it was unreachable for Dream, which shares Qwen's tokenizer.
+
+### Tests
+
+Both run on CPU in seconds with small random models — no checkpoint download:
+
+```bash
+python tests/test_llada_block_cache.py   # cache == full recompute, MHA and GQA
+python tests/test_guided_adapters.py     # Dream call path unchanged; 1:1 conversion
+```
+
+`test_llada_block_cache.py` checks that a full-length block-diffusion forward
+equals the stock LLaDA forward, and that a windowed forward equals the stock
+forward restricted to that window (positions outside the window served from
+cache). Both match exactly. A negative control confirms the windowed check is
+not vacuous.
+
+These tests do not cover end-to-end generation quality on real weights. Run the
+8-shot validation config against the published numbers below before trusting a
+LLaDA accuracy or throughput figure.
+
+### Validating against published numbers
 
 The published LLaDA figures give you something to check against. Useful
 reference points, all GSM8K 8-shot (generation length is not stated in those

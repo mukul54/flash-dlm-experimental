@@ -1,6 +1,8 @@
 # Core ML Dependencies (tested working versions)
 torch==2.7.0
-transformers>=4.56.0
+# guided_diffusion imports transformers.generation.utils._crop_past_key_values,
+# which was removed in 4.55. Verified working on 4.53.3; 4.55+ fails at import.
+transformers>=4.51.0,<4.54
 accelerate==1.3.0
 peft==0.14.0
 

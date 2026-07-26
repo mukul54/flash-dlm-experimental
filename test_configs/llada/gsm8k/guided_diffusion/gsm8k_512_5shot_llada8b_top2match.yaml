@@ -1,0 +1,74 @@
+# Guided diffusion on LLaDA-8B-Instruct, guided by Qwen2.5-1.5B-Instruct.
+# GSM8K, 5-shot, generation length 512, full 1319-problem test split.
+#
+# Uses the block-cached LLaDA implementation in src/model/llada_flash. The
+# stock uncached LLaDA in src/model/llada is left alone and is what you would
+# run for the 1.0x baseline row.
+#
+#   bash scripts/run_gsm8k_512_benchmark.sh <this file>
+seed: 42
+
+wandb:
+  project_name: flashdlm-baseline
+  experiment_name: gsm8k-512-5shot-llada8b-guided
+  flag: false
+
+model:
+  # autoregressive guider (verifier)
+  model_type: Qwen/Qwen2.5-1.5B-Instruct
+  # diffusion drafter
+  draft_model: GSAI-ML/LLaDA-8B-Instruct
+  # selects the LLaDA block-cache reset and disables the Dream logit shift
+  family: llada
+  single_device: true
+  dtype: bfloat16
+
+dataset:
+  name: "gsm8k"
+  train: "./dataset/gsm8k/inference/train.jsonl"
+  test:  "./dataset/gsm8k/inference/gsm8k_test.jsonl"
+  split: "test"
+  prm: false
+  nshot: 5
+  apply_chat_template: true
+
+save:
+  run_dir: results/baselines/llada8b_guided/gsm8k_512_5shot_top2match
+  logger: evaluation.log
+
+eval:
+  cot: true
+  max_gen_toks: 512
+  max_samples: 0
+  subsample_seed: 42
+  warmup_samples: 1
+
+train:
+  batch_size: 1
+
+dream:
+  steps: 512
+  eps: 1e-3
+
+  use_block_diffusion: true
+  block_size: 64
+  use_full_query_attn: false
+
+  use_sliding_window_caching: true
+  sliding_window_size: (256, 256)
+
+  early_stop: true
+  early_stop_consecutive: 1
+
+  # LLaDA's [MASK] token. Set explicitly because the LLaDA tokenizer does not
+  # reliably expose mask_token_id; remove this line to fall back to the
+  # tokenizer's own value.
+  mask_token_id: 126336
+
+  # "Top-2 Match" in the paper's tables
+  sampling_strategy: "topk"
+  acceptance_top_k: 2
+
+  verify_batch_size: 32
+
+  use_assisted: true

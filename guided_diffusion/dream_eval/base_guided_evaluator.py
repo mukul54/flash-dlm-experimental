@@ -33,6 +33,7 @@ from guided_diffusion.guided_diff_utils import (
     # assisted_generate,
     AssistedDiffusionConfig,
     ARAssistant,
+    MODEL_ADAPTERS,
 )
 
 
@@ -210,6 +211,16 @@ class BaseGuidedEvaluator:
         self.model_a = ModelMap(aname).fetch(device_map={"":self.ar_dev}, torch_dtype=dtype).to(self.ar_dev)
         self.tok_a   = load_tokenizer(aname)
 
+        # Diffusion-model family: selects how the block cache is reset and
+        # whether the Dream logit shift applies. Defaults to dream so existing
+        # Dream configs behave exactly as before.
+        family = self.cfg["model"].get("family", "dream")
+        if family not in MODEL_ADAPTERS:
+            raise ValueError(
+                f"unknown model.family {family!r}; expected one of {sorted(MODEL_ADAPTERS)}"
+            )
+        self.model_adapter = MODEL_ADAPTERS[family]
+
         # verifier
         if self.cfg["dream"].get("use_assisted",False):
             self.verifier = ARAssistant(self.model_a, self.tok_d, self.tok_a)
@@ -306,8 +317,8 @@ class BaseGuidedEvaluator:
             gcfg = C(
                 max_length=prompt_len+max_new,
                 max_new_tokens=max_new,
-                mask_token_id=self.tok_d.mask_token_id,
-                eos_token_id=self.tok_d.eos_token_id,
+                mask_token_id=self.cfg["dream"].get("mask_token_id", self.tok_d.mask_token_id),
+                eos_token_id=self.cfg["dream"].get("eos_token_id", self.tok_d.eos_token_id),
                 early_stop=self.cfg["dream"].get("early_stop",False),
                 early_stop_consecutive=self.cfg["dream"].get("early_stop_consecutive",1),
                 temperature=self.cfg["dream"].get("temperature",0.2),
@@ -328,6 +339,7 @@ class BaseGuidedEvaluator:
         n_warmup = self.cfg["eval"].get("warmup_samples", 0)
         if n_warmup > 0 and use_block and self.pairs:
             fn = assisted_block_diffusion_generate if use_assist else speculative_block_diffusion_generate
+            extra = {"model_adapter": self.model_adapter} if use_assist else {}
             for w in range(min(n_warmup, len(self.pairs))):
                 enc = self.tok_d(self.pairs[w][0], return_tensors="pt")
                 print(f"[warmup {w+1}/{n_warmup}] running untimed generation")
@@ -339,6 +351,7 @@ class BaseGuidedEvaluator:
                     config=_build_cfg(enc.input_ids.shape[1]),
                     dream_tokenizer=self.tok_d,
                     ar_tokenizer=self.tok_a,
+                    **extra,
                 )
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -368,6 +381,7 @@ class BaseGuidedEvaluator:
             t0 = time.perf_counter()
             if use_block:
                 fn = assisted_block_diffusion_generate if use_assist else speculative_block_diffusion_generate
+                extra = {"model_adapter": self.model_adapter} if use_assist else {}
                 out = fn(
                     dream_model=self.model_d,
                     ar_model=self.model_a,
@@ -376,6 +390,7 @@ class BaseGuidedEvaluator:
                     config=cfg,
                     dream_tokenizer=self.tok_d,
                     ar_tokenizer=self.tok_a,
+                    **extra,
                 )
             else:
                 # Use regular autoregressive generation without guided diffusion
